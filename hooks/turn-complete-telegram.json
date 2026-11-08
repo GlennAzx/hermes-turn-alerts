@@ -1,0 +1,13 @@
+{
+  "enabled": true,
+  "target": "telegram:152761768",
+  "skip_platforms": [
+    "telegram",
+    "subagent"
+  ],
+  "notify_on_failure": true,
+  "notify_on_interrupt": false,
+  "min_turn_seconds": 0,
+  "rate_limit_per_minute": 0,
+  "name_max_chars": 64
+}

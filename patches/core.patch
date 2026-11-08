@@ -1,0 +1,734 @@
+diff --git a/agent/shell_hooks.py b/agent/shell_hooks.py
+index 8751aeb6fd..16f8dc3594 100644
+--- a/agent/shell_hooks.py
++++ b/agent/shell_hooks.py
+@@ -297,7 +297,7 @@ def register_from_config(
+     for spec in specs:
+         key = (spec.event, spec.matcher, spec.command)
+         with _registered_lock:
+-            if key in _registered:
++            if key in _registered or _installed_on(manager, spec):
+                 continue
+             already_allowlisted = _is_allowlisted(spec.event, spec.command)
+ 
+@@ -315,7 +315,7 @@ def register_from_config(
+                 continue
+ 
+         with _registered_lock:
+-            if key in _registered:
++            if key in _registered or _installed_on(manager, spec):
+                 continue
+             manager._hooks.setdefault(spec.event, []).append(_make_callback(spec))
+             _registered.add(key)
+@@ -635,9 +635,24 @@ def _make_callback(spec: ShellHookSpec) -> Callable[..., Optional[Dict[str, Any]
+ 
+     _callback.__name__ = f"shell_hook[{spec.event}:{spec.command}]"
+     _callback.__qualname__ = _callback.__name__
++    # Identity stamp: lets register_from_config() see what the manager's table
++    # ALREADY holds. Discovery rebuilds that table and managers are per-home, so
++    # a process-global "registered" set alone can either duplicate a hook or
++    # skip one that was wiped. The table is the truth.
++    _callback._hermes_shell_hook = (spec.event, spec.matcher, spec.command)
+     return _callback
+ 
+ 
++def _installed_on(manager, spec: ShellHookSpec) -> bool:
++    """True when this exact spec already sits in the manager's hook table."""
++    stamp = (spec.event, spec.matcher, spec.command)
++    try:
++        callbacks = manager._hooks.get(spec.event) or []
++    except Exception:
++        return False
++    return any(getattr(cb, "_hermes_shell_hook", None) == stamp for cb in callbacks)
++
++
+ def _fail_closed_block(spec: ShellHookSpec, reason: str) -> Dict[str, Any]:
+     """Canonical block shape for a ``fail_closed`` hook that failed."""
+     return {
+diff --git a/apps/desktop/src/app/settings/notifications-settings.tsx b/apps/desktop/src/app/settings/notifications-settings.tsx
+index b2810f691f..1f5c47cf66 100644
+--- a/apps/desktop/src/app/settings/notifications-settings.tsx
++++ b/apps/desktop/src/app/settings/notifications-settings.tsx
+@@ -108,10 +108,28 @@ export function NotificationsSettings() {
+       />
+ 
+       <div className="mt-4 flex flex-col gap-2">
+-        <Button className="self-start" onClick={() => void runTest()} size="sm" type="button" variant="outline">
+-          <Bell />
+-          {copy.test}
+-        </Button>
++        <div className="flex flex-wrap items-center gap-2">
++          <Button className="self-start" onClick={() => void runTest()} size="sm" type="button" variant="outline">
++            <Bell />
++            {copy.test}
++          </Button>
++          <Button
++            className="self-start"
++            onClick={() => {
++              triggerHaptic('open')
++              // The turn-alert plugin owns its own controls; it cannot be
++              // imported here (runtime-loaded), so it listens for this event
++              // and opens its workspace tab.
++              window.dispatchEvent(new CustomEvent('hermes:open-turn-alerts'))
++            }}
++            size="sm"
++            type="button"
++            variant="outline"
++          >
++            <Bell />
++            Turn alerts: look, sound, voice
++          </Button>
++        </div>
+         <Caption>{copy.focusedHint}</Caption>
+       </div>
+     </SettingsContent>
+diff --git a/apps/desktop/src/app/shell/model-catalog-menu.tsx b/apps/desktop/src/app/shell/model-catalog-menu.tsx
+index 541a17d61c..60ffc22919 100644
+--- a/apps/desktop/src/app/shell/model-catalog-menu.tsx
++++ b/apps/desktop/src/app/shell/model-catalog-menu.tsx
+@@ -61,6 +61,13 @@ export interface ModelChoice {
+   fast: boolean
+   model: string
+   provider: string
++  /** This chat keeps its primary model when the global fallback chain would
++   *  otherwise take over (per-chat pin, config.set key="fallback"). */
++  fallbackDisabled?: boolean
++  /** The install has a fallback chain at all; without one the row is hidden. */
++  fallbackAvailable?: boolean
++  /** Turn-complete Telegram push for THIS chat (config.set key="telegram_push"). */
++  telegramPush?: boolean
+ }
+ 
+ /**
+@@ -83,7 +90,7 @@ export interface ModelMenuController {
+   select: (model: string, provider: string) => Promise<boolean | void> | void
+   /** Edit ONE option on a row. `isActive` says whether it's the current model. */
+   setOptions: (
+-    patch: { effort?: string; fast?: boolean },
++    patch: { effort?: string; fast?: boolean; fallback?: boolean; telegramPush?: boolean },
+     row: { isActive: boolean; model: string; provider: string }
+   ) => void
+ }
+@@ -465,8 +472,11 @@ export function ModelCatalogMenu({
+                           canDisableReasoning={caps?.can_disable_reasoning}
+                           defaultEffort={defaultEffort}
+                           effort={effEffort}
++                          fallbackAvailable={controller.current.fallbackAvailable}
++                          fallbackDisabled={controller.current.fallbackDisabled}
+                           fastControl={fastControl}
+                           isActive={isCurrent}
++                          telegramPush={controller.current.telegramPush}
+                           model={family.id}
+                           onSelectModel={nextModel => controller.select(nextModel, group.provider.slug)}
+                           onSetOptions={patch =>
+diff --git a/apps/desktop/src/app/shell/model-edit-submenu.tsx b/apps/desktop/src/app/shell/model-edit-submenu.tsx
+index 68b7281345..1406f89c32 100644
+--- a/apps/desktop/src/app/shell/model-edit-submenu.tsx
++++ b/apps/desktop/src/app/shell/model-edit-submenu.tsx
+@@ -71,6 +71,9 @@ interface ModelEditSubmenuProps {
+   effort: string
+   /** How fast mode is offered for this model (param toggle vs. variant swap). */
+   fastControl: FastControl
++  /** This chat's fallback pin. Chat-scoped, so only the ACTIVE row offers it. */
++  fallbackAvailable?: boolean
++  fallbackDisabled?: boolean
+   /** Whether this row's model is the active one. */
+   isActive: boolean
+   /** This row's model id. */
+@@ -81,11 +84,13 @@ interface ModelEditSubmenuProps {
+    *  session, a preset store, or the gateway itself — the owning surface's
+    *  controller decides what an edit means. That's what lets the same submenu
+    *  drive a live chat session and a detached per-task override. */
+-  onSetOptions: (patch: { effort?: string; fast?: boolean }) => void
++  onSetOptions: (patch: { effort?: string; fast?: boolean; fallback?: boolean; telegramPush?: boolean }) => void
+   /** This row's provider slug. */
+   provider: string
+   /** Whether this model supports reasoning effort. */
+   reasoning: boolean
++  /** This chat's turn-complete Telegram push switch, read from model.options. */
++  telegramPush?: boolean
+ }
+ 
+ export function ModelEditSubmenu(props: ModelEditSubmenuProps) {
+@@ -105,11 +110,14 @@ function ModelEditSubmenuBody({
+   canDisableReasoning,
+   defaultEffort,
+   effort,
++  fallbackAvailable,
++  fallbackDisabled,
+   fastControl,
+   isActive,
+   onSelectModel,
+   onSetOptions,
+-  reasoning
++  reasoning,
++  telegramPush
+ }: ModelEditSubmenuProps) {
+   const { t } = useI18n()
+   const copy = t.shell.modelOptions
+@@ -162,6 +170,28 @@ function ModelEditSubmenuBody({
+           <Switch checked={fastOn} className="ml-auto" onCheckedChange={setFast} size="xs" />
+         </DropdownMenuItem>
+       ) : null}
++      {isActive && fallbackAvailable ? (
++        <DropdownMenuItem className={dropdownMenuRow} onSelect={event => event.preventDefault()}>
++          {copy.fallbackRow}
++          <Switch
++            checked={!fallbackDisabled}
++            className="ml-auto"
++            onCheckedChange={checked => onSetOptions({ fallback: checked })}
++            size="xs"
++          />
++        </DropdownMenuItem>
++      ) : null}
++      {isActive ? (
++        <DropdownMenuItem className={dropdownMenuRow} onSelect={event => event.preventDefault()}>
++          {copy.telegramRow}
++          <Switch
++            checked={Boolean(telegramPush)}
++            className="ml-auto"
++            onCheckedChange={checked => onSetOptions({ telegramPush: checked })}
++            size="xs"
++          />
++        </DropdownMenuItem>
++      ) : null}
+       {reasoning ? (
+         <>
+           <DropdownMenuSeparator className="mx-0" />
+diff --git a/apps/desktop/src/app/shell/model-menu-panel.tsx b/apps/desktop/src/app/shell/model-menu-panel.tsx
+index 7e6fa4ab45..36ffc4092a 100644
+--- a/apps/desktop/src/app/shell/model-menu-panel.tsx
++++ b/apps/desktop/src/app/shell/model-menu-panel.tsx
+@@ -183,6 +183,41 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
+     }
+   }
+ 
++  // Per-chat fallback pin. The model menu is the natural home: it already
++  // lists what this chat runs on, and the pin only changes which model a
++  // rate-limit/billing failure is allowed to switch TO.
++  const fallbackDisabled = Boolean(modelOptions.data?.fallback_disabled)
++  const fallbackAvailable = Boolean(modelOptions.data?.fallback_available)
++  // Default OFF: only an explicit true turns this chat's push on.
++  const telegramPush = modelOptions.data?.telegram_push === true
++
++  const patchChatSwitch = async (key: 'fallback' | 'telegram_push', next: boolean) => {
++    if (!activeSessionId) {
++      return
++    }
++
++    const queryKey = modelOptionsQueryKey(profile, activeSessionId)
++    const previous = modelOptions.data
++
++    if (previous) {
++      queryClient.setQueryData<ModelOptionsResponse>(queryKey, {
++        ...previous,
++        ...(key === 'fallback' ? { fallback_disabled: !next } : { telegram_push: next })
++      })
++    }
++
++    try {
++      await requestGateway('config.set', { key, session_id: activeSessionId, value: next ? 'on' : 'off' })
++    } catch (err) {
++      if (previous) {
++        queryClient.setQueryData<ModelOptionsResponse>(queryKey, previous)
++      }
++
++      notifyError(err, copy.fallbackFailed ?? copy.refreshModels)
++    }
++  }
++
++
+   const controller: ModelMenuController = {
+     // Selecting a model row restores that model's remembered preset onto the
+     // session (effort/fast). applyModelPreset owns the batched gateway write.
+@@ -199,9 +234,12 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
+ 
+     current: {
+       effort: currentReasoningEffort,
++      fallbackAvailable,
++      fallbackDisabled,
+       fast: currentFastMode,
+       model: optionsModel,
+-      provider: optionsProvider
++      provider: optionsProvider,
++      telegramPush
+     },
+ 
+     presetFor: (provider, model) => modelPresets[modelPresetKey(provider, model)] ?? {},
+@@ -232,6 +270,16 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
+       if (patch.fast !== undefined) {
+         void patchFast(patch.fast, row.provider, row.model)
+       }
++
++      // Chat-scoped, not model-scoped: `fallback` here is the row's "allow
++      // fallback" switch and `telegramPush` gates this chat's push.
++      if (patch.fallback !== undefined) {
++        void patchChatSwitch('fallback', patch.fallback)
++      }
++
++      if (patch.telegramPush !== undefined) {
++        void patchChatSwitch('telegram_push', patch.telegramPush)
++      }
+     }
+   }
+ 
+@@ -239,17 +287,19 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
+     <ModelCatalogMenu
+       controller={controller}
+       footer={
+-        <DropdownMenuItem
+-          className={cn(dropdownMenuRow, 'text-(--ui-text-tertiary)')}
+-          disabled={refreshing}
+-          onSelect={event => {
+-            event.preventDefault()
+-            void refreshModels()
+-          }}
+-        >
+-          <Codicon className={cn(refreshing && 'animate-spin')} name="sync" size="0.75rem" />
+-          {copy.refreshModels}
+-        </DropdownMenuItem>
++        <>
++          <DropdownMenuItem
++            className={cn(dropdownMenuRow, 'text-(--ui-text-tertiary)')}
++            disabled={refreshing}
++            onSelect={event => {
++              event.preventDefault()
++              void refreshModels()
++            }}
++          >
++            <Codicon className={cn(refreshing && 'animate-spin')} name="sync" size="0.75rem" />
++            {copy.refreshModels}
++          </DropdownMenuItem>
++        </>
+       }
+       gateway={gateway}
+       includeMoa
+diff --git a/apps/desktop/src/i18n/en.ts b/apps/desktop/src/i18n/en.ts
+index 14befa8f5f..10b420e8be 100644
+--- a/apps/desktop/src/i18n/en.ts
++++ b/apps/desktop/src/i18n/en.ts
+@@ -2840,13 +2840,19 @@ export const en: Translations = {
+       noModels: 'No models found',
+       editModels: 'Edit models…',
+       refreshModels: 'Refresh models',
+-      fast: 'Fast'
++      fast: 'Fast',
++      fallbackOn: 'Fallback: on for this chat',
++      fallbackOff: 'Fallback: off for this chat',
++      fallbackNone: 'No fallback chain configured',
++      fallbackFailed: 'Could not change fallback for this chat'
+     },
+     modelOptions: {
+       noOptions: 'No options for this model',
+       options: 'Options',
+       thinking: 'Thinking',
+       fast: 'Fast',
++      fallbackRow: 'Fallback',
++      telegramRow: 'Telegram push',
+       effort: 'Effort',
+       minimal: 'Minimal',
+       low: 'Low',
+diff --git a/apps/desktop/src/i18n/types.ts b/apps/desktop/src/i18n/types.ts
+index 015fa30aee..2ab448a564 100644
+--- a/apps/desktop/src/i18n/types.ts
++++ b/apps/desktop/src/i18n/types.ts
+@@ -2407,12 +2407,22 @@ export interface Translations {
+       editModels: string
+       refreshModels: string
+       fast: string
++      /** Per-chat fallback pin row (config.set key="fallback"). Optional so
++       *  locales that have not translated it still typecheck. */
++      fallbackOn?: string
++      fallbackOff?: string
++      fallbackNone?: string
++      fallbackFailed?: string
+     }
+     modelOptions: {
+       noOptions: string
+       options: string
+       thinking: string
+       fast: string
++      /** Per-chat rows in a model's hover submenu; optional so untranslated
++       *  locales still typecheck. */
++      fallbackRow?: string
++      telegramRow?: string
+       effort: string
+       minimal: string
+       low: string
+diff --git a/apps/desktop/src/types/hermes.ts b/apps/desktop/src/types/hermes.ts
+index 24ba2f5ecc..512ad2ecbb 100644
+--- a/apps/desktop/src/types/hermes.ts
++++ b/apps/desktop/src/types/hermes.ts
+@@ -439,6 +439,12 @@ export interface ModelOptionsResponse {
+   model?: string
+   provider?: string
+   providers?: ModelOptionProvider[]
++  /** This chat is pinned to its primary model (no fallback chain). */
++  fallback_disabled?: boolean
++  /** The install has a fallback_providers/fallback_model chain configured. */
++  fallback_available?: boolean
++  /** Turn-complete Telegram push for THIS chat (false = silenced). */
++  telegram_push?: boolean
+ }
+ 
+ export interface PaginatedSessions {
+diff --git a/hermes_cli/lifecycle.py b/hermes_cli/lifecycle.py
+index 350e3880af..2cf5d6cda4 100644
+--- a/hermes_cli/lifecycle.py
++++ b/hermes_cli/lifecycle.py
+@@ -19,6 +19,25 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
+ 
+     from hermes_cli import plugins
+ 
++    # Shell hooks live in the manager's hook table, and that table belongs to
++    # ONE manager per resolved home. A turn can run under a different profile
++    # scope than the one that registered them, and discovery rebuilds the table
++    # outright, so a config-owned hook can be missing exactly when its event
++    # fires. Re-registering here is cheap (config is cached) and idempotent;
++    # without it `hooks:` entries in config.yaml are silently dead on the
++    # desktop/TUI backend.
++    if hook_name == "on_session_end":
++        try:
++            # register_from_config() is idempotent against the manager's OWN
++            # table, so this repairs a wiped table without stacking a duplicate
++            # callback on every turn.
++            from agent.shell_hooks import register_from_config
++            from hermes_cli.config import load_config
++
++            register_from_config(load_config())
++        except Exception:
++            logger.debug("shell-hook re-registration before on_session_end failed", exc_info=True)
++
+     return plugins.invoke_hook(hook_name, **kwargs)
+ 
+ 
+diff --git a/tests/test_tui_gateway_server.py b/tests/test_tui_gateway_server.py
+index 6166c5e57f..8d9c738ee7 100644
+--- a/tests/test_tui_gateway_server.py
++++ b/tests/test_tui_gateway_server.py
+@@ -21452,3 +21452,79 @@ def test_workspace_move_rehomes_running_session(monkeypatch, tmp_path):
+     assert captured["row_update"] == (target, str(new_cwd))
+     assert live["cwd"] == str(new_cwd)
+     assert live.get("explicit_cwd") is True
++
++
++def test_config_set_fallback_pins_one_session(monkeypatch):
++    """config.set key=fallback empties this chat's chain, persists the pin, and restores it."""
++    entry = {"provider": "openrouter", "model": "deepseek/deepseek-v4.1-flash-1017"}
++    monkeypatch.setattr(server, "_load_fallback_model", lambda: [dict(entry)])
++
++    class _DB:
++        def __init__(self):
++            self.row = {"model_config": None}
++
++        def get_session(self, key):
++            return dict(self.row)
++
++        def update_session_meta(self, key, config, model=None):
++            self.row["model_config"] = config
++
++    db = _DB()
++    agent = types.SimpleNamespace(
++        _fallback_chain=[dict(entry)],
++        _fallback_model=dict(entry),
++        _fallback_index=0,
++        _session_db=db,
++        model="deepseek/deepseek-v4.1-flash-1017",
++        provider="openrouter",
++        base_url="",
++        api_mode="",
++        service_tier=None,
++        reasoning_config=None,
++    )
++    server._sessions["sid"] = _session(agent=agent)
++    try:
++        off = server.handle_request(
++            {"id": "1", "method": "config.set", "params": {"session_id": "sid", "key": "fallback", "value": "off"}}
++        )
++        assert off["result"]["value"] == "off"
++        assert agent._fallback_chain == []
++        assert json.loads(db.row["model_config"])["fallback_disabled"] is True
++
++        status = server.handle_request(
++            {"id": "2", "method": "config.set", "params": {"session_id": "sid", "key": "fallback", "value": "status"}}
++        )
++        assert status["result"]["value"] == "off"
++
++        on = server.handle_request(
++            {"id": "3", "method": "config.set", "params": {"session_id": "sid", "key": "fallback", "value": "on"}}
++        )
++        assert on["result"]["value"] == "on"
++        assert agent._fallback_chain == [entry]
++        assert "fallback_disabled" not in json.loads(db.row["model_config"])
++    finally:
++        server._sessions.clear()
++
++
++def test_config_set_fallback_requires_a_session():
++    resp = server.handle_request(
++        {"id": "9", "method": "config.set", "params": {"session_id": "nope", "key": "fallback", "value": "off"}}
++    )
++    assert resp["error"]["code"] == 4002
++
++
++def test_stored_fallback_disabled_reads_json_rows():
++    """The pin is read from the stored model_config, string or dict."""
++
++    class _DB:
++        def __init__(self, raw):
++            self.raw = raw
++
++        def get_session(self, key):
++            return {"model_config": self.raw}
++
++    assert server._stored_fallback_disabled(_DB('{"fallback_disabled": true}'), "s") is True
++    assert server._stored_fallback_disabled(_DB({"fallback_disabled": True}), "s") is True
++    assert server._stored_fallback_disabled(_DB('{"model": "m"}'), "s") is False
++    assert server._stored_fallback_disabled(_DB(None), "s") is False
++    assert server._stored_fallback_disabled(None, "s") is False
+diff --git a/tui_gateway/methods_complete.py b/tui_gateway/methods_complete.py
+index 08b1c02b3f..9aac33b5bc 100644
+--- a/tui_gateway/methods_complete.py
++++ b/tui_gateway/methods_complete.py
+@@ -484,6 +484,24 @@ def _(rid, params: dict) -> dict:
+             include_unconfigured=bool(params.get("include_unconfigured")),
+             refresh=bool(params.get("refresh")),
+         )
++        # Per-session fallback pin, so the model menu can paint its toggle
++        # without a second round-trip (config.set key="fallback" writes it).
++        if session is not None:
++            if session.get("fallback_disabled") is None:
++                session["fallback_disabled"] = _stored_fallback_disabled(
++                    getattr(agent, "_session_db", None) or _get_db(),
++                    str(session.get("session_key") or params.get("session_id") or ""),
++                )
++            payload["fallback_disabled"] = bool(session.get("fallback_disabled"))
++            payload["fallback_available"] = bool(_load_fallback_model())
++            if session.get("telegram_push") is None:
++                stored = _stored_session_model_config(
++                    getattr(agent, "_session_db", None) or _get_db(),
++                    str(session.get("session_key") or params.get("session_id") or ""),
++                )
++                # Default OFF: the switch starts down in every chat.
++                session["telegram_push"] = bool(stored.get("telegram_push"))
++            payload["telegram_push"] = bool(session.get("telegram_push"))
+         return _ok(rid, payload)
+     except Exception as e:
+         return _err(rid, 5033, str(e))
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index c36eebd7df..437f7e068b 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -5533,6 +5533,19 @@ def _persist_live_session_runtime(session: dict | None) -> None:
+             if isinstance(parsed, dict):
+                 existing_config = parsed
+         model_config = _runtime_model_config(agent, existing_config)
++        # Session-scoped switch and pin. Both survive a restart because they live
++        # on the row; None (this live dict never saw the RPC) leaves whatever is
++        # already stored, so a routine persist cannot erase another writer's value.
++        _fallback_pin = session.get("fallback_disabled")
++        if _fallback_pin is None:
++            pass
++        elif _fallback_pin:
++            model_config["fallback_disabled"] = True
++        else:
++            model_config.pop("fallback_disabled", None)
++        _telegram_push = session.get("telegram_push")
++        if _telegram_push is not None:
++            model_config["telegram_push"] = bool(_telegram_push)
+         create_service_tier_override = session.get("create_service_tier_override")
+         if create_service_tier_override is not None:
+             # _runtime_model_config sees agent.service_tier=None for explicit
+@@ -8458,6 +8471,40 @@ def _agent_fallback_model(agent):
+     return _load_fallback_model()
+ 
+ 
++def _stored_session_model_config(session_db, session_key: str) -> dict:
++    """A session row's ``model_config`` as a dict (per-chat pins live there)."""
++    if not session_key or session_db is None:
++        return {}
++
++    try:
++        row = session_db.get_session(session_key) or {}
++    except Exception:
++        return {}
++
++    raw_config = row.get("model_config") if isinstance(row, dict) else None
++    if isinstance(raw_config, dict):
++        return raw_config
++    if isinstance(raw_config, str) and raw_config.strip():
++        try:
++            parsed = json.loads(raw_config)
++        except Exception:
++            return {}
++        return parsed if isinstance(parsed, dict) else {}
++
++    return {}
++
++
++def _stored_fallback_disabled(session_db, session_key: str) -> bool:
++    """True when this session pinned fallback off in its stored model_config.
++
++    The pin lives in the session row (``model_config.fallback_disabled``), not
++    config.yaml, so one chat keeps its primary model while every other chat
++    still walks the global ``fallback_providers`` chain.
++    """
++    return bool(_stored_session_model_config(session_db, session_key).get("fallback_disabled"))
++
++
++
+ def _background_agent_kwargs(agent, task_id: str) -> dict:
+     cfg = _load_cfg()
+ 
+@@ -8848,6 +8895,23 @@ def _make_agent(
+         pass
+ 
+     cfg = _load_cfg()
++    # Shell hooks are registered PER PROCESS, and this backend serves every
++    # desktop chat. Two rules matter here:
++    #   1. Without this call a `hooks:` entry never reaches a GUI turn, so
++    #      `on_session_end` silently never fires (gateway/run.py and the CLI
++    #      register on their own entry points).
++    #   2. Discovery MUST run first: `PluginManager.discover_and_load()`
++    #      rebuilds the hook table, so a hook appended before it is wiped by
++    #      the lazy discovery inside the first `invoke_hook` (#60036).
++    try:
++        from hermes_cli import plugins as _plugins
++
++        _plugins._ensure_plugins_discovered()
++        from agent.shell_hooks import register_from_config
++
++        register_from_config(cfg)
++    except Exception:
++        logger.debug("shell-hook registration failed in tui_gateway", exc_info=True)
+     from hermes_cli.config import resolve_ephemeral_system_prompt_from_config
+ 
+     system_prompt = resolve_ephemeral_system_prompt_from_config(cfg)
+@@ -8945,6 +9009,11 @@ def _make_agent(
+                 raise RuntimeError("Auth fallback resolved without a model")
+             model = resolution.selected_model
+     _pr = _load_provider_routing()
++    # Per-session opt-out: a chat can keep its primary model even when the
++    # global fallback_providers chain is set (config.set key="fallback").
++    _fallback_disabled = _stored_fallback_disabled(
++        session_db if session_db is not None else _get_db(), session_id or key
++    )
+     return AIAgent(
+         model=model,
+         max_iterations=_cfg_max_turns(cfg, 500),
+@@ -8989,7 +9058,7 @@ def _make_agent(
+         pass_session_id=is_truthy_value(os.environ.get("HERMES_TUI_PASS_SESSION_ID")),
+         skip_context_files=is_truthy_value(os.environ.get("HERMES_IGNORE_RULES")),
+         skip_memory=is_truthy_value(os.environ.get("HERMES_IGNORE_RULES")),
+-        fallback_model=_load_fallback_model(),
++        fallback_model=None if _fallback_disabled else _load_fallback_model(),
+         **_agent_cbs(sid),
+     )
+ 
+@@ -14481,6 +14550,106 @@ def _(rid, params: dict) -> dict:
+         except Exception as e:
+             return _err(rid, 5001, str(e))
+ 
++    if key == "fallback":
++        # Session-scoped: keep THIS chat on its primary model when the global
++        # fallback_providers chain would otherwise take over on a 429/billing/
++        # transport failure. Persisted on the session row, so it survives a
++        # backend restart and does not touch config.yaml.
++        raw = str(value or "").strip().lower()
++
++        if session is None:
++            return _err(rid, 4002, "fallback can only be set for an existing session")
++
++        agent = session.get("agent")
++        chain = _load_fallback_model() or []
++        if session.get("fallback_disabled") is None:
++            session["fallback_disabled"] = _stored_fallback_disabled(
++                getattr(agent, "_session_db", None) or _get_db(),
++                str(session.get("session_key") or params.get("session_id") or ""),
++            )
++        current_disabled = bool(session.get("fallback_disabled"))
++
++        if raw in {"status"}:
++            return _ok(
++                rid,
++                {
++                    "key": key,
++                    "value": "off" if current_disabled else "on",
++                    "fallback_available": bool(chain),
++                },
++            )
++
++        if raw in {"", "toggle"}:
++            target_disabled = not current_disabled
++        elif raw in {"off", "disabled", "disable", "false", "no", "0"}:
++            target_disabled = True
++        elif raw in {"on", "enabled", "enable", "true", "yes", "1"}:
++            target_disabled = False
++        else:
++            return _err(rid, 4002, f"unknown fallback value: {value}")
++
++        session["fallback_disabled"] = target_disabled
++
++        if agent is not None:
++            # Mutate the LIVE agent so the pin applies to the next API call, not
++            # the next session build. An already-activated fallback keeps its
++            # provider until the normal per-turn primary restore; clearing the
++            # chain only stops NEW switches.
++            if target_disabled:
++                agent._fallback_chain = []
++                agent._fallback_model = None
++                agent._fallback_index = 0
++            else:
++                agent._fallback_chain = list(chain)
++                agent._fallback_model = chain[0] if chain else None
++                agent._fallback_index = 0
++
++        _persist_live_session_runtime(session)
++
++        return _ok(
++            rid,
++            {
++                "key": key,
++                "value": "off" if target_disabled else "on",
++                "fallback_available": bool(chain),
++            },
++        )
++
++    if key == "telegram_push":
++        # Per-chat switch for the turn-complete Telegram push. The hook reads it
++        # from the session row (model_config.telegram_push), so it survives a
++        # restart and applies to every future turn in this chat.
++        raw = str(value or "").strip().lower()
++        if session is None:
++            return _err(rid, 4002, "telegram_push can only be set for an existing session")
++
++        agent = session.get("agent")
++        if session.get("telegram_push") is None:
++            stored = _stored_session_model_config(
++                getattr(agent, "_session_db", None) or _get_db(),
++                str(session.get("session_key") or params.get("session_id") or ""),
++            )
++            # Default OFF: a chat pushes only after the user opts in.
++            session["telegram_push"] = bool(stored.get("telegram_push"))
++        current = bool(session.get("telegram_push"))
++
++        if raw == "status":
++            return _ok(rid, {"key": key, "value": "on" if current else "off"})
++
++        if raw in {"", "toggle"}:
++            target = not current
++        elif raw in {"off", "disabled", "disable", "false", "no", "0"}:
++            target = False
++        elif raw in {"on", "enabled", "enable", "true", "yes", "1"}:
++            target = True
++        else:
++            return _err(rid, 4002, f"unknown telegram_push value: {value}")
++
++        session["telegram_push"] = target
++        _persist_live_session_runtime(session)
++
++        return _ok(rid, {"key": key, "value": "on" if target else "off"})
++
+     if key == "details_mode":
+         nv = str(value or "").strip().lower()
+         if nv not in _DETAIL_MODES:
